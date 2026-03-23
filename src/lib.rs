@@ -7,15 +7,22 @@ pub fn init() {
 }
 
 #[chorograph_plugin]
-pub fn identify_project(_root: String, files: Vec<String>) -> Option<ProjectProfile> {
+pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfile> {
     // 1. Find project file (.csproj or .fsproj)
-    let project_file = files.iter().find(|f| f.ends_with(".csproj") || f.ends_with(".fsproj"))?;
+    let project_file_name = files.iter().find(|f| f.ends_with(".csproj") || f.ends_with(".fsproj"))?;
     
-    // 2. Read the project file content from the host
-    let content = match read_host_file(project_file) {
+    // 2. Build absolute path
+    let full_path = if root.ends_with('/') {
+        format!("{}{}", root, project_file_name)
+    } else {
+        format!("{}/{}", root, project_file_name)
+    };
+
+    // 3. Read the project file content from the host
+    let content = match read_host_file(&full_path) {
         Ok(c) => c,
         Err(e) => {
-            log!("Failed to read project file {}: {:?}", project_file, e);
+            log!("Failed to read project file {}: {:?}", full_path, e);
             return None;
         }
     };
@@ -24,7 +31,7 @@ pub fn identify_project(_root: String, files: Vec<String>) -> Option<ProjectProf
     let mut category = "Library".to_string();
     let mut tags = vec![".NET".to_string()];
 
-    if project_file.ends_with(".csproj") {
+    if project_file_name.ends_with(".csproj") {
         tags.push("C#".to_string());
     } else {
         tags.push("F#".to_string());

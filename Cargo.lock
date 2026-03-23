@@ -24,6 +24,7 @@ dependencies = [
 [[package]]
 name = "chorograph-plugin-macros"
 version = "0.1.0"
+source = "git+https://github.com/adevcorn/chorograph-plugin-sdk-rust.git?branch=main#6d8ad8035c00c9e9f6bb36ee655ca8047a40b57c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -33,6 +34,7 @@ dependencies = [
 [[package]]
 name = "chorograph-plugin-sdk-rust"
 version = "0.1.0"
+source = "git+https://github.com/adevcorn/chorograph-plugin-sdk-rust.git?branch=main#6d8ad8035c00c9e9f6bb36ee655ca8047a40b57c"
 dependencies = [
  "chorograph-plugin-macros",
  "serde",
