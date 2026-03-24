@@ -127,6 +127,10 @@ fn detect_category(root: &str, files: &[String], csproj: &str) -> String {
             if RE_MAP_ROUTE.is_match(&prog) {
                 return "WebAPI".to_string();
             }
+            // MapGroup wires up endpoint groups defined elsewhere → WebAPI
+            if prog.contains(".MapGroup(") {
+                return "WebAPI".to_string();
+            }
             // Razor Pages
             if prog.contains("AddRazorPages") || prog.contains("MapRazorPages") {
                 return "WebApp (MVC/Pages)".to_string();
@@ -211,13 +215,15 @@ fn detect_webapi_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
         }
     }
 
-    // Minimal API scan (Program.cs / app.Map*)
-    let program_files: Vec<&String> = files
+    // Minimal API scan — search all .cs files for app.Map* registrations.
+    // This covers endpoint extension classes (e.g. Endpoints/DrawsEndpoints.cs)
+    // where routes are defined outside of Program.cs.
+    let cs_files: Vec<&String> = files
         .iter()
-        .filter(|f| f.to_lowercase().ends_with("program.cs"))
+        .filter(|f| f.to_lowercase().ends_with(".cs"))
         .collect();
 
-    for rel_path in program_files {
+    for rel_path in cs_files {
         let full = join_path(root, rel_path);
         if let Ok(src) = read_host_file(&full) {
             let mut eps = scan_minimal_api_routes(rel_path, &src);
@@ -274,28 +280,33 @@ fn scan_controller_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
     entry_points
 }
 
-/// Scan Program.cs for minimal API route registrations:
+/// Scan a C# file for minimal API route registrations:
 /// app.MapGet("/path", ...), app.MapPost(...), etc.
+/// Operates on the full file string so multiline calls are matched:
+///   _ = app.MapPost(
+///       "/validate",
 fn scan_minimal_api_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
     let mut entry_points = Vec::new();
 
-    for (i, line) in src.lines().enumerate() {
-        if let Some(caps) = RE_MAP_ROUTE.captures(line) {
-            let verb = caps
-                .get(1)
-                .map(|m| m.as_str().to_uppercase())
-                .unwrap_or_default();
-            let route = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
-            let label = format!("{} {}", verb, route);
+    for caps in RE_MAP_ROUTE.captures_iter(src) {
+        let verb = caps
+            .get(1)
+            .map(|m| m.as_str().to_uppercase())
+            .unwrap_or_default();
+        let route = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+        let label = format!("{} {}", verb, route);
 
-            entry_points.push(EntryPoint {
-                label,
-                path: rel_path.to_string(),
-                line: Some((i + 1) as u32),
-                method: Some(verb),
-                description: None,
-            });
-        }
+        // Compute 1-based line number from the byte offset of the match start.
+        let match_start = caps.get(0).map(|m| m.start()).unwrap_or(0);
+        let line_number = src[..match_start].chars().filter(|&c| c == '\n').count() + 1;
+
+        entry_points.push(EntryPoint {
+            label,
+            path: rel_path.to_string(),
+            line: Some(line_number as u32),
+            method: Some(verb),
+            description: None,
+        });
     }
 
     entry_points
