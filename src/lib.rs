@@ -108,7 +108,19 @@ pub fn handle_action(_action_id: String, _payload: serde_json::Value) {
 // ---------------------------------------------------------------------------
 
 fn detect_category(root: &str, files: &[String], csproj: &str) -> String {
-    if csproj.contains("Sdk=\"Microsoft.NET.Sdk.Web\"") {
+    // Log the first 500 chars of the csproj so we can see what SDK is declared.
+    let preview: String = csproj.chars().take(500).collect();
+    log!("detect_category root={} csproj_preview={}", root, preview);
+
+    // Match Web SDK regardless of quote style (double or single) and regardless
+    // of whether it appears as an XML attribute on <Project Sdk="..."> or as a
+    // standalone <Sdk Name="..." /> element.
+    let is_web_sdk = csproj.contains("Sdk=\"Microsoft.NET.Sdk.Web\"")
+        || csproj.contains("Sdk='Microsoft.NET.Sdk.Web'")
+        || csproj.contains("<Sdk Name=\"Microsoft.NET.Sdk.Web\"")
+        || csproj.contains("<Sdk Name='Microsoft.NET.Sdk.Web'");
+
+    if is_web_sdk {
         // The SDK attribute is in the .csproj, but AddControllers/MapControllers
         // live in Program.cs / Startup.cs — so we read those files.
         let program_content = read_first_matching_file(root, files, |name| {
@@ -116,15 +128,17 @@ fn detect_category(root: &str, files: &[String], csproj: &str) -> String {
             lower == "program.cs" || lower == "startup.cs"
         });
 
-        if let Some(prog) = program_content {
+        if let Some(ref prog) = program_content {
+            log!("detect_category: found program file, checking patterns");
             if prog.contains("AddControllersWithViews") || prog.contains("AddMvc") {
                 return "WebApp (MVC/Pages)".to_string();
             }
+            // Match both `AddControllers(` and `.AddControllers(` (builder pattern)
             if prog.contains("AddControllers") || prog.contains("MapControllers") {
                 return "WebAPI".to_string();
             }
             // Minimal API registrations (app.MapGet/MapPost etc.) → WebAPI
-            if RE_MAP_ROUTE.is_match(&prog) {
+            if RE_MAP_ROUTE.is_match(prog) {
                 return "WebAPI".to_string();
             }
             // MapGroup wires up endpoint groups defined elsewhere → WebAPI
@@ -135,12 +149,35 @@ fn detect_category(root: &str, files: &[String], csproj: &str) -> String {
             if prog.contains("AddRazorPages") || prog.contains("MapRazorPages") {
                 return "WebApp (MVC/Pages)".to_string();
             }
+        } else {
+            log!("detect_category: no program.cs/startup.cs found in files list");
+        }
+
+        // Fallback: if there are controller files it's a WebAPI even without an
+        // explicit AddControllers() call (e.g. conventions-based registration).
+        let has_controllers = files.iter().any(|f| {
+            let lower = f.to_lowercase();
+            lower.ends_with("controller.cs")
+                || lower.contains("/controllers/")
+                || lower.contains("\\controllers\\")
+        });
+        if has_controllers {
+            log!(
+                "detect_category: no program.cs pattern matched but controllers dir found → WebAPI"
+            );
+            return "WebAPI".to_string();
         }
 
         return "WebApp".to_string();
     }
 
-    if csproj.contains("Sdk=\"Microsoft.NET.Sdk.Worker\"") {
+    // Worker SDK — same quote-style variants
+    let is_worker_sdk = csproj.contains("Sdk=\"Microsoft.NET.Sdk.Worker\"")
+        || csproj.contains("Sdk='Microsoft.NET.Sdk.Worker'")
+        || csproj.contains("<Sdk Name=\"Microsoft.NET.Sdk.Worker\"")
+        || csproj.contains("<Sdk Name='Microsoft.NET.Sdk.Worker'");
+
+    if is_worker_sdk {
         return "Worker".to_string();
     }
 
@@ -154,6 +191,7 @@ fn detect_category(root: &str, files: &[String], csproj: &str) -> String {
         return "ConsoleApp".to_string();
     }
 
+    log!("detect_category: fell through to Library for root={}", root);
     "Library".to_string()
 }
 
