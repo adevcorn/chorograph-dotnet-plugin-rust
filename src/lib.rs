@@ -33,9 +33,6 @@ static RE_EXECUTE_ASYNC: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?:protected|public)\s+override\s+async\s+Task\s+ExecuteAsync\s*\(").unwrap()
 });
 
-static RE_BG_SERVICE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"class\s+\w+\s*:\s*(?:\w+\s*,\s*)*BackgroundService").unwrap());
-
 static RE_CREATE_MAUI_APP: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?:public|internal)\s+static\s+MauiApp\s+CreateMauiApp\s*\(").unwrap()
 });
@@ -423,7 +420,14 @@ fn detect_worker_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
     for rel_path in files.iter().filter(|f| f.ends_with(".cs")) {
         let full = join_path(root, rel_path);
         if let Ok(src) = read_host_file(&full) {
-            if !RE_BG_SERVICE.is_match(&src) {
+            // Use a simple contains check rather than a single-line regex so that
+            // C# 12 primary constructor syntax is handled correctly:
+            //
+            //   public class MyWorker(ILogger<MyWorker> logger, ...)  // line 1
+            //       : BackgroundService                                // separate line
+            //
+            // A per-line regex would never see both tokens on the same line.
+            if !src.contains("BackgroundService") {
                 continue;
             }
             for (i, line) in src.lines().enumerate() {
