@@ -1,5 +1,57 @@
 use chorograph_plugin_sdk_rust::prelude::*;
+use once_cell::sync::Lazy;
 use regex::Regex;
+
+// ---------------------------------------------------------------------------
+// Compiled regexes (compiled once, safe in WASM)
+// ---------------------------------------------------------------------------
+
+static RE_TARGET_FRAMEWORK: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<TargetFramework>(.*?)</TargetFramework>").unwrap());
+
+static RE_CLASS_ROUTE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"\[Route\s*\(\s*"([^"]+)"\s*\)\]"#).unwrap());
+
+static RE_HTTP_METHOD: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\[(Http(?:Get|Post|Put|Delete|Patch|Head|Options))\s*(?:\(\s*"([^"]*)"\s*\))?\]"#)
+        .unwrap()
+});
+
+static RE_MAP_ROUTE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"app\s*\.\s*Map(Get|Post|Put|Delete|Patch)\s*\(\s*"([^"]+)""#).unwrap()
+});
+
+static RE_RAZOR_HANDLER: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:public|protected)\s+[\w<>\[\]]+\s+(On(Get|Post|Put|Delete|Patch)\w*)\s*\(")
+        .unwrap()
+});
+
+static RE_MAIN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"static\s+(?:async\s+)?(?:void|Task|int)\s+Main\s*\(").unwrap());
+
+static RE_EXECUTE_ASYNC: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:protected|public)\s+override\s+async\s+Task\s+ExecuteAsync\s*\(").unwrap()
+});
+
+static RE_BG_SERVICE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"class\s+\w+\s*:\s*(?:\w+\s*,\s*)*BackgroundService").unwrap());
+
+static RE_CREATE_MAUI_APP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:public|internal)\s+static\s+MauiApp\s+CreateMauiApp\s*\(").unwrap()
+});
+
+static RE_ON_STARTUP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:protected\s+override\s+void\s+OnStartup|void\s+Application_Startup)\s*\(")
+        .unwrap()
+});
+
+// Matches the last PascalCase identifier before '(' on a method signature line.
+static RE_METHOD_NAME: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b([A-Z][A-Za-z0-9_]*)\s*\(").unwrap());
+
+// ---------------------------------------------------------------------------
+// Plugin entry points
+// ---------------------------------------------------------------------------
 
 #[chorograph_plugin]
 pub fn init() {
@@ -13,11 +65,9 @@ pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfi
         .iter()
         .find(|f| f.ends_with(".csproj") || f.ends_with(".fsproj"))?;
 
-    // 2. Build absolute path
+    // 2. Build absolute path and read the project file
     let full_path = join_path(&root, project_file_name);
-
-    // 3. Read the project file content from the host
-    let content = match read_host_file(&full_path) {
+    let csproj_content = match read_host_file(&full_path) {
         Ok(c) => c,
         Err(e) => {
             log!("Failed to read project file {}: {:?}", full_path, e);
@@ -25,7 +75,7 @@ pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfi
         }
     };
 
-    // 4. Detect language tag
+    // 3. Detect language tag
     let mut tags = vec![".NET".to_string()];
     if project_file_name.ends_with(".csproj") {
         tags.push("C#".to_string());
@@ -33,15 +83,15 @@ pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfi
         tags.push("F#".to_string());
     }
 
-    // 5. Detect category
-    let category = detect_category(&content);
+    // 4. Detect category — reads Program.cs for Web SDK projects
+    let category = detect_category(&root, &files, &csproj_content);
 
-    // 6. Detect target framework tag
-    if let Some(tf) = detect_target_framework(&content) {
+    // 5. Detect target framework tag
+    if let Some(tf) = detect_target_framework(&csproj_content) {
         tags.push(tf);
     }
 
-    // 7. Detect entry points based on category
+    // 6. Detect entry points based on category
     let entry_points = detect_entry_points(&root, &files, &category);
 
     Some(ProjectProfile {
@@ -60,21 +110,40 @@ pub fn handle_action(_action_id: String, _payload: serde_json::Value) {
 // Category detection
 // ---------------------------------------------------------------------------
 
-fn detect_category(csproj: &str) -> String {
+fn detect_category(root: &str, files: &[String], csproj: &str) -> String {
     if csproj.contains("Sdk=\"Microsoft.NET.Sdk.Web\"") {
-        if csproj.contains("AddControllersWithViews") || csproj.contains("AddMvc") {
-            return "WebApp (MVC/Pages)".to_string();
-        } else if csproj.contains("AddControllers") || csproj.contains("MapControllers") {
-            return "WebAPI".to_string();
-        } else {
-            return "WebApp".to_string();
+        // The SDK attribute is in the .csproj, but AddControllers/MapControllers
+        // live in Program.cs / Startup.cs — so we read those files.
+        let program_content = read_first_matching_file(root, files, |name| {
+            let lower = name.to_lowercase();
+            lower == "program.cs" || lower == "startup.cs"
+        });
+
+        if let Some(prog) = program_content {
+            if prog.contains("AddControllersWithViews") || prog.contains("AddMvc") {
+                return "WebApp (MVC/Pages)".to_string();
+            }
+            if prog.contains("AddControllers") || prog.contains("MapControllers") {
+                return "WebAPI".to_string();
+            }
+            // Minimal API registrations (app.MapGet/MapPost etc.) → WebAPI
+            if RE_MAP_ROUTE.is_match(&prog) {
+                return "WebAPI".to_string();
+            }
+            // Razor Pages
+            if prog.contains("AddRazorPages") || prog.contains("MapRazorPages") {
+                return "WebApp (MVC/Pages)".to_string();
+            }
         }
+
+        return "WebApp".to_string();
     }
+
     if csproj.contains("Sdk=\"Microsoft.NET.Sdk.Worker\"") {
         return "Worker".to_string();
     }
+
     if csproj.contains("<OutputType>Exe</OutputType>") {
-        // Distinguish native/MAUI/WinForms/WPF from plain console
         if csproj.contains("UseMaui")
             || csproj.contains("UseWindowsForms")
             || csproj.contains("UseWPF")
@@ -83,6 +152,7 @@ fn detect_category(csproj: &str) -> String {
         }
         return "ConsoleApp".to_string();
     }
+
     "Library".to_string()
 }
 
@@ -91,15 +161,13 @@ fn detect_category(csproj: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn detect_target_framework(csproj: &str) -> Option<String> {
-    // Fast path for common versions
+    // Fast path for common versions (avoids regex overhead in happy path)
     for ver in &["net9.0", "net8.0", "net7.0", "net6.0"] {
         if csproj.contains(&format!("<TargetFramework>{}</TargetFramework>", ver)) {
             return Some(ver.to_string());
         }
     }
-    // Regex fallback
-    let re = Regex::new(r"<TargetFramework>(.*?)</TargetFramework>").ok()?;
-    let caps = re.captures(csproj)?;
+    let caps = RE_TARGET_FRAMEWORK.captures(csproj)?;
     caps.get(1).map(|m| m.as_str().to_string())
 }
 
@@ -125,7 +193,9 @@ fn detect_entry_points(root: &str, files: &[String], category: &str) -> Vec<Entr
 fn detect_webapi_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
     let mut entry_points = Vec::new();
 
-    // Controller scan
+    // Controller scan:
+    // - Top-level files ending in "controller.cs" (covers shallow listing)
+    // - Subdirectory paths containing /controllers/ or \controllers\
     let controller_files: Vec<&String> = files
         .iter()
         .filter(|f| {
@@ -165,18 +235,8 @@ fn detect_webapi_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
 fn scan_controller_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
     let mut entry_points = Vec::new();
 
-    // Regex for class-level [Route("...")] — captures the base route template
-    let class_route_re =
-        Regex::new(r#"\[Route\s*\(\s*"([^"]+)"\s*\)\]"#).unwrap_or_else(|_| unreachable!());
-
-    // Regex for method-level HTTP verb attributes, e.g. [HttpGet("path")] or [HttpGet]
-    let method_re = Regex::new(
-        r#"\[(Http(?:Get|Post|Put|Delete|Patch|Head|Options))\s*(?:\(\s*"([^"]*)"\s*\))?\]"#,
-    )
-    .unwrap_or_else(|_| unreachable!());
-
-    // Extract base route (first match on the class)
-    let base_route = class_route_re
+    // Extract base route (first class-level [Route("...")])
+    let base_route = RE_CLASS_ROUTE
         .captures(src)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
@@ -185,7 +245,7 @@ fn scan_controller_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
     let lines: Vec<&str> = src.lines().collect();
 
     for (i, line) in lines.iter().enumerate() {
-        if let Some(caps) = method_re.captures(line) {
+        if let Some(caps) = RE_HTTP_METHOD.captures(line) {
             let verb_full = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let verb = verb_full
                 .strip_prefix("Http")
@@ -193,11 +253,10 @@ fn scan_controller_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
                 .to_uppercase();
             let fragment = caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
 
-            // Build full route by joining base + fragment
             let route = build_route(&base_route, fragment);
             let label = format!("{} {}", verb, route);
 
-            // Try to grab the method name from the next non-blank line
+            // Try to grab the method name from the next non-attribute, non-blank line
             let description = lines
                 .get(i + 1)
                 .map(|l| l.trim())
@@ -218,16 +277,13 @@ fn scan_controller_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
     entry_points
 }
 
-/// Scan Program.cs (or similar) for minimal API route registrations:
+/// Scan Program.cs for minimal API route registrations:
 /// app.MapGet("/path", ...), app.MapPost(...), etc.
 fn scan_minimal_api_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
     let mut entry_points = Vec::new();
 
-    let map_re = Regex::new(r#"app\s*\.\s*Map(Get|Post|Put|Delete|Patch)\s*\(\s*"([^"]+)""#)
-        .unwrap_or_else(|_| unreachable!());
-
     for (i, line) in src.lines().enumerate() {
-        if let Some(caps) = map_re.captures(line) {
+        if let Some(caps) = RE_MAP_ROUTE.captures(line) {
             let verb = caps
                 .get(1)
                 .map(|m| m.as_str().to_uppercase())
@@ -274,7 +330,7 @@ fn detect_webapp_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
         }
     }
 
-    // Razor Pages: look for *.cshtml.cs files with OnGet/OnPost page handler methods
+    // Razor Pages: *.cshtml.cs files with OnGet/OnPost handlers
     let page_files: Vec<&String> = files
         .iter()
         .filter(|f| f.to_lowercase().ends_with(".cshtml.cs"))
@@ -295,22 +351,15 @@ fn detect_webapp_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
 fn scan_razor_page_handlers(rel_path: &str, src: &str) -> Vec<EntryPoint> {
     let mut entry_points = Vec::new();
 
-    // Matches: public IActionResult OnGet(), public async Task<IActionResult> OnPostAsync(), etc.
-    let handler_re =
-        Regex::new(r"(?:public|protected)\s+[\w<>\[\]]+\s+(On(Get|Post|Put|Delete|Patch)\w*)\s*\(")
-            .unwrap_or_else(|_| unreachable!());
-
     for (i, line) in src.lines().enumerate() {
-        if let Some(caps) = handler_re.captures(line) {
+        if let Some(caps) = RE_RAZOR_HANDLER.captures(line) {
             let method_name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
             let verb = caps
                 .get(2)
                 .map(|m| m.as_str().to_uppercase())
                 .unwrap_or_default();
 
-            // Derive a page route from the file path: strip .cshtml.cs, keep relative segment
             let page_route = rel_path.trim_end_matches(".cshtml.cs").replace('\\', "/");
-
             let label = format!("{} {} ({})", verb, page_route, method_name);
 
             entry_points.push(EntryPoint {
@@ -331,7 +380,7 @@ fn scan_razor_page_handlers(rel_path: &str, src: &str) -> Vec<EntryPoint> {
 // ---------------------------------------------------------------------------
 
 fn detect_console_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
-    // Prefer Program.cs, otherwise scan all .cs files
+    // Prefer Program.cs; otherwise scan all top-level .cs files
     let candidates: Vec<&String> = {
         let program: Vec<&String> = files
             .iter()
@@ -344,14 +393,11 @@ fn detect_console_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> 
         }
     };
 
-    let main_re = Regex::new(r"static\s+(?:async\s+)?(?:void|Task|int)\s+Main\s*\(")
-        .unwrap_or_else(|_| unreachable!());
-
     for rel_path in candidates {
         let full = join_path(root, rel_path);
         if let Ok(src) = read_host_file(&full) {
             for (i, line) in src.lines().enumerate() {
-                if main_re.is_match(line) {
+                if RE_MAIN.is_match(line) {
                     return vec![EntryPoint {
                         label: "Main()".to_string(),
                         path: rel_path.to_string(),
@@ -372,23 +418,16 @@ fn detect_console_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> 
 // ---------------------------------------------------------------------------
 
 fn detect_worker_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
-    let execute_re =
-        Regex::new(r"(?:protected|public)\s+override\s+async\s+Task\s+ExecuteAsync\s*\(")
-            .unwrap_or_else(|_| unreachable!());
-
-    let bg_service_re = Regex::new(r"class\s+\w+\s*:\s*(?:\w+\s*,\s*)*BackgroundService")
-        .unwrap_or_else(|_| unreachable!());
-
     let mut entry_points = Vec::new();
 
     for rel_path in files.iter().filter(|f| f.ends_with(".cs")) {
         let full = join_path(root, rel_path);
         if let Ok(src) = read_host_file(&full) {
-            if !bg_service_re.is_match(&src) {
+            if !RE_BG_SERVICE.is_match(&src) {
                 continue;
             }
             for (i, line) in src.lines().enumerate() {
-                if execute_re.is_match(line) {
+                if RE_EXECUTE_ASYNC.is_match(line) {
                     entry_points.push(EntryPoint {
                         label: "ExecuteAsync()".to_string(),
                         path: rel_path.to_string(),
@@ -411,23 +450,11 @@ fn detect_worker_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
 fn detect_native_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
     let mut entry_points = Vec::new();
 
-    // MAUI: CreateMauiApp() in MauiProgram.cs
-    let maui_re = Regex::new(r"(?:public|internal)\s+static\s+MauiApp\s+CreateMauiApp\s*\(")
-        .unwrap_or_else(|_| unreachable!());
-
-    // WinForms / WPF: Main() or OnStartup() / Application_Startup
-    let main_re = Regex::new(r"static\s+(?:async\s+)?(?:void|Task|int)\s+Main\s*\(")
-        .unwrap_or_else(|_| unreachable!());
-
-    let startup_re =
-        Regex::new(r"(?:protected\s+override\s+void\s+OnStartup|void\s+Application_Startup)\s*\(")
-            .unwrap_or_else(|_| unreachable!());
-
     for rel_path in files.iter().filter(|f| f.ends_with(".cs")) {
         let full = join_path(root, rel_path);
         if let Ok(src) = read_host_file(&full) {
             for (i, line) in src.lines().enumerate() {
-                if maui_re.is_match(line) {
+                if RE_CREATE_MAUI_APP.is_match(line) {
                     entry_points.push(EntryPoint {
                         label: "CreateMauiApp()".to_string(),
                         path: rel_path.to_string(),
@@ -435,7 +462,7 @@ fn detect_native_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
                         method: Some("STARTUP".to_string()),
                         description: Some("MAUI application bootstrap".to_string()),
                     });
-                } else if main_re.is_match(line) {
+                } else if RE_MAIN.is_match(line) {
                     entry_points.push(EntryPoint {
                         label: "Main()".to_string(),
                         path: rel_path.to_string(),
@@ -443,7 +470,7 @@ fn detect_native_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
                         method: Some("MAIN".to_string()),
                         description: Some("Application entry point".to_string()),
                     });
-                } else if startup_re.is_match(line) {
+                } else if RE_ON_STARTUP.is_match(line) {
                     entry_points.push(EntryPoint {
                         label: "OnStartup()".to_string(),
                         path: rel_path.to_string(),
@@ -471,24 +498,39 @@ fn join_path(root: &str, file: &str) -> String {
     }
 }
 
+/// Read the first file in `files` whose bare name matches the predicate.
+/// Returns `None` if no matching file is found or all reads fail.
+fn read_first_matching_file<F>(root: &str, files: &[String], predicate: F) -> Option<String>
+where
+    F: Fn(&str) -> bool,
+{
+    for f in files {
+        // Compare only the bare filename (last path component) against the predicate
+        let bare = f.rsplit('/').next().unwrap_or(f);
+        if predicate(bare) {
+            let full = join_path(root, f);
+            if let Ok(content) = read_host_file(&full) {
+                return Some(content);
+            }
+        }
+    }
+    None
+}
+
 /// Combine a controller base route with a method-level route fragment.
-/// Handles [controller] and [action] tokens and leading-slash rules.
 fn build_route(base: &str, fragment: &str) -> String {
     let base = base.trim_matches('/');
     let fragment = fragment.trim_matches('/');
     if fragment.is_empty() {
         format!("/{}", base)
     } else if fragment.starts_with('/') {
-        // Absolute override — fragment wins entirely
         fragment.to_string()
     } else {
         format!("/{}/{}", base, fragment)
     }
 }
 
-/// Given a line that should contain a method signature, extract the method name.
+/// Given a method signature line, extract the method name (last PascalCase ident before `(`).
 fn extract_method_name(line: &str) -> Option<&str> {
-    // Look for: <modifiers> <return_type> <MethodName>(
-    let re = Regex::new(r"\b([A-Z][A-Za-z0-9_]*)\s*\(").ok()?;
-    re.captures(line)?.get(1).map(|m| m.as_str())
+    RE_METHOD_NAME.captures(line)?.get(1).map(|m| m.as_str())
 }
