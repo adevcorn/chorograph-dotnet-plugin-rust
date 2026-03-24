@@ -188,30 +188,37 @@ fn detect_entry_points(root: &str, files: &[String], category: &str) -> Vec<Entr
 }
 
 // ---------------------------------------------------------------------------
-// WebAPI: controller route attributes + minimal API (Program.cs)
+// WebAPI: controller route attributes + minimal API
 // ---------------------------------------------------------------------------
 
 fn detect_webapi_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
     let mut entry_points = Vec::new();
 
-    // Controller scan:
-    // - Top-level files ending in "controller.cs" (covers shallow listing)
-    // - Subdirectory paths containing /controllers/ or \controllers\
-    let controller_files: Vec<&String> = files
-        .iter()
-        .filter(|f| {
-            let lower = f.to_lowercase();
-            lower.ends_with("controller.cs")
-                || lower.contains("/controllers/")
-                || lower.contains("\\controllers\\")
-        })
-        .collect();
+    // --- Controller scan ---
+    // Try LSP first: ask the host for workspace symbols, then filter for
+    // method-level symbols (SymbolKind 6) in controller files.  If the LSP
+    // session is not ready (returns Err or empty), fall back to regex.
+    let lsp_controller_eps = lsp_controller_entry_points(root, files);
+    if !lsp_controller_eps.is_empty() {
+        entry_points.extend(lsp_controller_eps);
+    } else {
+        // Regex fallback: scan controller files directly.
+        let controller_files: Vec<&String> = files
+            .iter()
+            .filter(|f| {
+                let lower = f.to_lowercase();
+                lower.ends_with("controller.cs")
+                    || lower.contains("/controllers/")
+                    || lower.contains("\\controllers\\")
+            })
+            .collect();
 
-    for rel_path in controller_files {
-        let full = join_path(root, rel_path);
-        if let Ok(src) = read_host_file(&full) {
-            let mut eps = scan_controller_routes(rel_path, &src);
-            entry_points.append(&mut eps);
+        for rel_path in controller_files {
+            let full = join_path(root, rel_path);
+            if let Ok(src) = read_host_file(&full) {
+                let mut eps = scan_controller_routes(rel_path, &src);
+                entry_points.append(&mut eps);
+            }
         }
     }
 
@@ -229,6 +236,134 @@ fn detect_webapi_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
             let mut eps = scan_minimal_api_routes(rel_path, &src);
             entry_points.append(&mut eps);
         }
+    }
+
+    entry_points
+}
+
+/// Ask the host LSP for workspace symbols, filter for method-level symbols
+/// (SymbolKind 6) in controller files, then read each file to extract the
+/// HTTP verb and route from the surrounding attribute annotations.
+/// Returns an empty vec if LSP is unavailable or returns no relevant symbols —
+/// callers should fall back to `scan_controller_routes` in that case.
+fn lsp_controller_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
+    // Build a quick lookup set of known relative paths for controller files.
+    let controller_paths: std::collections::HashSet<&str> = files
+        .iter()
+        .filter(|f| {
+            let lower = f.to_lowercase();
+            lower.ends_with("controller.cs")
+                || lower.contains("/controllers/")
+                || lower.contains("\\controllers\\")
+        })
+        .map(|s| s.as_str())
+        .collect();
+
+    if controller_paths.is_empty() {
+        return vec![];
+    }
+
+    let symbols = match workspace_symbols_from_host(root) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    if symbols.is_empty() {
+        return vec![];
+    }
+
+    let mut entry_points: Vec<EntryPoint> = Vec::new();
+
+    // Cache file contents so we don't re-read the same file for every symbol.
+    let mut file_cache: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for sym in &symbols {
+        // Only method-level symbols (LSP SymbolKind 6).
+        if sym.kind != 6 {
+            continue;
+        }
+
+        // Match LSP's absolute file_path against our relative controller paths.
+        // LSP returns absolute paths; our `files` list is relative to root.
+        let rel_path = controller_paths.iter().find(|&&rel| {
+            let lower_fp = sym.file_path.to_lowercase();
+            let lower_rel = rel.to_lowercase().replace('\\', "/");
+            lower_fp.ends_with(&lower_rel)
+        });
+
+        let rel_path = match rel_path {
+            Some(r) => *r,
+            None => continue,
+        };
+
+        // Load and cache file lines.
+        if !file_cache.contains_key(rel_path) {
+            let full = join_path(root, rel_path);
+            match read_host_file(&full) {
+                Ok(src) => {
+                    file_cache.insert(
+                        rel_path.to_string(),
+                        src.lines().map(|l| l.to_string()).collect(),
+                    );
+                }
+                Err(_) => continue,
+            }
+        }
+
+        let lines = match file_cache.get(rel_path) {
+            Some(l) => l,
+            None => continue,
+        };
+
+        // sym.line is 0-based from LSP; convert to 0-based index.
+        let method_line_idx = sym.line as usize;
+
+        // Find the class-level [Route] for base route — scan upward from the
+        // method line, stopping at a reasonable limit.
+        let base_route = lines[..method_line_idx.min(lines.len())]
+            .iter()
+            .rev()
+            .take(200)
+            .find_map(|l| {
+                RE_CLASS_ROUTE
+                    .captures(l)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().to_string())
+            })
+            .unwrap_or_default();
+
+        // Scan up to 5 lines *before* the method line for [HttpVerb] attribute.
+        let attr_line = lines[..method_line_idx.min(lines.len())]
+            .iter()
+            .rev()
+            .take(5)
+            .find_map(|l| RE_HTTP_METHOD.captures(l).map(|c| c));
+
+        let (verb, route) = match attr_line {
+            Some(caps) => {
+                let verb_full = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let verb = verb_full
+                    .strip_prefix("Http")
+                    .unwrap_or(verb_full)
+                    .to_uppercase();
+                let fragment = caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+                (verb, build_route(&base_route, fragment))
+            }
+            // No [HttpVerb] attribute found nearby — not an action method.
+            None => continue,
+        };
+
+        let label = format!("{} {}", verb, route);
+
+        entry_points.push(EntryPoint {
+            label,
+            path: rel_path.to_string(),
+            // LSP line is 0-based; EntryPoint.line is 1-based.
+            line: Some(method_line_idx as u32 + 1),
+            method: Some(verb),
+            description: Some(sym.name.clone()),
+        });
     }
 
     entry_points
