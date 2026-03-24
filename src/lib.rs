@@ -363,6 +363,7 @@ fn lsp_controller_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> 
             line: Some(method_line_idx as u32 + 1),
             method: Some(verb),
             description: Some(sym.name.clone()),
+            detection_source: Some("lsp".to_string()),
         });
     }
 
@@ -408,6 +409,7 @@ fn scan_controller_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
                 line: Some((i + 1) as u32),
                 method: Some(verb),
                 description,
+                detection_source: Some("regex".to_string()),
             });
         }
     }
@@ -441,6 +443,7 @@ fn scan_minimal_api_routes(rel_path: &str, src: &str) -> Vec<EntryPoint> {
             line: Some(line_number as u32),
             method: Some(verb),
             description: None,
+            detection_source: Some("regex".to_string()),
         });
     }
 
@@ -511,6 +514,7 @@ fn scan_razor_page_handlers(rel_path: &str, src: &str) -> Vec<EntryPoint> {
                 line: Some((i + 1) as u32),
                 method: Some(verb),
                 description: Some(method_name),
+                detection_source: Some("regex".to_string()),
             });
         }
     }
@@ -547,6 +551,7 @@ fn detect_console_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> 
                         line: Some((i + 1) as u32),
                         method: Some("MAIN".to_string()),
                         description: Some("Application entry point".to_string()),
+                        detection_source: Some("regex".to_string()),
                     }];
                 }
             }
@@ -584,6 +589,7 @@ fn detect_worker_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
                         line: Some((i + 1) as u32),
                         method: Some("EXECUTE".to_string()),
                         description: Some("Background worker execution loop".to_string()),
+                        detection_source: Some("regex".to_string()),
                     });
                 }
             }
@@ -611,6 +617,7 @@ fn detect_native_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
                         line: Some((i + 1) as u32),
                         method: Some("STARTUP".to_string()),
                         description: Some("MAUI application bootstrap".to_string()),
+                        detection_source: Some("regex".to_string()),
                     });
                 } else if RE_MAIN.is_match(line) {
                     entry_points.push(EntryPoint {
@@ -619,6 +626,7 @@ fn detect_native_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
                         line: Some((i + 1) as u32),
                         method: Some("MAIN".to_string()),
                         description: Some("Application entry point".to_string()),
+                        detection_source: Some("regex".to_string()),
                     });
                 } else if RE_ON_STARTUP.is_match(line) {
                     entry_points.push(EntryPoint {
@@ -627,6 +635,7 @@ fn detect_native_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
                         line: Some((i + 1) as u32),
                         method: Some("STARTUP".to_string()),
                         description: Some("Application startup handler".to_string()),
+                        detection_source: Some("regex".to_string()),
                     });
                 }
             }
