@@ -152,6 +152,7 @@ pub fn detect_run_status(root: String) -> Option<RunStatus> {
         is_running,
         url: if is_running { Some(url) } else { None },
         pid: None,
+        resources: vec![],
     })
 }
 
