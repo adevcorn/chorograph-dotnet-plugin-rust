@@ -119,6 +119,134 @@ pub fn handle_action(_action_id: String, _payload: serde_json::Value) {
     // No-op for now
 }
 
+#[chorograph_plugin]
+pub fn detect_run_status(root: String) -> Option<RunStatus> {
+    // Only meaningful for web project categories — detect category first by
+    // re-running the lightweight category check without file list (csproj only).
+    // We do a quick check: look for a .csproj in the root directory listing and
+    // read it to see if it's a Web SDK project.
+    let csproj_content = find_and_read_csproj(&root)?;
+
+    let is_web = csproj_content.contains("Sdk=\"Microsoft.NET.Sdk.Web\"")
+        || csproj_content.contains("Sdk='Microsoft.NET.Sdk.Web'")
+        || csproj_content.contains("<Sdk Name=\"Microsoft.NET.Sdk.Web\"")
+        || csproj_content.contains("<Sdk Name='Microsoft.NET.Sdk.Web'");
+
+    if !is_web {
+        return None;
+    }
+
+    // Read Properties/launchSettings.json to find the applicationUrl.
+    let launch_settings_path = join_path(&root, "Properties/launchSettings.json");
+    let launch_settings = match read_host_file(&launch_settings_path) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let url = parse_application_url(&launch_settings)?;
+    let port = parse_port_from_url(&url)?;
+
+    let is_running = tcp_probe("localhost", port);
+
+    Some(RunStatus {
+        is_running,
+        url: if is_running { Some(url) } else { None },
+        pid: None,
+    })
+}
+
+/// Try to find and read a .csproj file directly in the project root.
+fn find_and_read_csproj(root: &str) -> Option<String> {
+    // We don't have a directory listing here, so try common patterns.
+    // The host file API supports arbitrary paths, so we try to read a sentinel
+    // file that lists directory contents — but we don't have that.
+    // Instead, ask the host to read a known path: the csproj must be at
+    // <root>/<basename>.csproj. Derive basename from the last path component of root.
+    let basename = root.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+
+    if !basename.is_empty() {
+        let candidate = join_path(root, &format!("{}.csproj", basename));
+        if let Ok(content) = read_host_file(&candidate) {
+            return Some(content);
+        }
+        // Try .fsproj too
+        let candidate_fs = join_path(root, &format!("{}.fsproj", basename));
+        if let Ok(content) = read_host_file(&candidate_fs) {
+            return Some(content);
+        }
+    }
+    None
+}
+
+/// Parse the first `applicationUrl` value from a launchSettings.json string.
+/// Prefers https:// URLs; falls back to http://.
+fn parse_application_url(json: &str) -> Option<String> {
+    // Rather than pulling in a full JSON parser we do a targeted string search.
+    // The key always appears as: "applicationUrl": "..."
+    // Multiple URLs may be separated by ";" — take the first https:// one,
+    // falling back to the first http:// one.
+    let mut http_fallback: Option<String> = None;
+
+    // Find all occurrences of "applicationUrl": "<value>"
+    let mut search = json;
+    while let Some(key_pos) = search.find("\"applicationUrl\"") {
+        let after_key = &search[key_pos + "\"applicationUrl\"".len()..];
+        // Find the colon and then the opening quote
+        if let Some(colon_pos) = after_key.find(':') {
+            let after_colon = after_key[colon_pos + 1..].trim_start();
+            if after_colon.starts_with('"') {
+                let inner = &after_colon[1..];
+                if let Some(end_quote) = inner.find('"') {
+                    let raw_value = &inner[..end_quote];
+                    // Value may be "url1;url2;..." — split on ';'
+                    for part in raw_value.split(';') {
+                        let part = part.trim();
+                        if part.starts_with("https://") {
+                            return Some(part.to_string());
+                        }
+                        if part.starts_with("http://") && http_fallback.is_none() {
+                            http_fallback = Some(part.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Advance past this occurrence
+        let skip = key_pos + 1;
+        if skip >= search.len() {
+            break;
+        }
+        search = &search[skip..];
+    }
+
+    http_fallback
+}
+
+/// Parse the port number from a URL string like "http://localhost:5241" or "https://localhost:7001".
+fn parse_port_from_url(url: &str) -> Option<u16> {
+    // Find the last ':' that is followed by digits (the port part).
+    // Strip scheme first: skip past "://"
+    let after_scheme = if let Some(pos) = url.find("://") {
+        &url[pos + 3..]
+    } else {
+        url
+    };
+    // Now we have "localhost:5241" or "localhost:7001/path"
+    if let Some(colon_pos) = after_scheme.rfind(':') {
+        let port_str = &after_scheme[colon_pos + 1..];
+        // Trim any path suffix
+        let port_str = port_str.split('/').next().unwrap_or(port_str);
+        port_str.parse::<u16>().ok()
+    } else {
+        // No explicit port — use default
+        if url.starts_with("https://") {
+            Some(443)
+        } else {
+            Some(80)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Category detection
 // ---------------------------------------------------------------------------
